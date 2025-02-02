@@ -9,3 +9,4 @@ Build using Go: go build -o mac_serial .
 
 The RP2040 microcontroller supports a serial connection over USB. The serial utility allows sending commands to the RP2040 to start/stop the reading/sending of temperature data as well as to set the reading/sending interval (in seconds, defautls to 1).
 
+Based on design needs, the microcontroller could easily be adpated to receive a max temp value and always be reading the temperature, but only report it if it exceeded the max value.
