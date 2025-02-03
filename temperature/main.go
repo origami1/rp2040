@@ -1,27 +1,57 @@
 package main
 
 import (
+	"image/color"
 	"machine"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"tinygo.org/x/drivers/ws2812"
+)
+
+const (
+	minInterval    = 100 // Minimum interval in milliseconds.
+	sendingLedTime = 50  // Time in milliseconds to keep the LED in the sending color.
+)
+
+var (
+	// The onboard LED is used to indicate that the sensor is running.
+	// It is a bit particular: set the color to green first, then you can set any color.
+	neo machine.Pin = 25
+
+	// Colors for the NeoPixel.
+	black   = color.RGBA{R: 0x00, G: 0x00, B: 0x00}
+	red     = color.RGBA{R: 0xff, G: 0x00, B: 0x00}
+	green   = color.RGBA{R: 0x00, G: 0xff, B: 0x00}
+	yellow  = color.RGBA{R: 0x00, G: 0xff, B: 0xff}
+	off     = red
+	on      = green
+	sending = black // Setting to black is more visible.
 )
 
 // Currently still an issue with atomics in TinyGo, so use
 // a mutex to protect our variables here.
-type Sensor struct {
-	interval int // in seconds
-	stop     bool
-	lock     sync.RWMutex
+type SensorSettings struct {
+	interval  int // in milliseconds
+	stop      bool
+	ledDriver *ws2812.Device
+	lock      sync.RWMutex
 }
 
 func main() {
+	// Initialize the NeoPixel.
+	neo.Configure(machine.PinConfig{Mode: machine.PinOutput})
+	ws := ws2812.NewWS2812(neo)
+	setupLED(ws)
+
 	// Initialize the sensor settings.
-	s := Sensor{
-		interval: 1,
-		stop:     false,
+	s := SensorSettings{
+		interval:  1000, // 1 second
+		ledDriver: &ws,
+		stop:      false,
 	}
 
 	// Configure the serial port.
@@ -30,7 +60,7 @@ func main() {
 	})
 
 	// Start a goroutine to continuously read serial data.
-	go s.receiveSerial()
+	go s.ReceiveSerial()
 
 	// Main loop: read and print temperature periodically.
 	for {
@@ -45,22 +75,45 @@ func main() {
 			continue
 		}
 
-		ReadTemperature()
-		time.Sleep(time.Duration(interval) * time.Second)
+		s.ReadTemperature()
+
+		// Wait for the next interval. (minus the time spent above in ReadTemperature)
+		time.Sleep(time.Duration(interval-sendingLedTime) * time.Millisecond)
 	}
+}
+
+// Setup the LED. The NeoPixel is a bit particular: it requires green to be set first (i.e., on startup).
+func setupLED(ws ws2812.Device) {
+	// Green
+	ws.WriteColors([]color.RGBA{green})
+	// A slight pause
+	time.Sleep(100 * time.Millisecond)
+	// Off (black in this case)
+	ws.WriteColors([]color.RGBA{black})
 }
 
 // ReadTemperature reads and converts the raw temperature reading.
 // Also sends data on serial port.
-func ReadTemperature() {
+func (s *SensorSettings) ReadTemperature() {
+	// Set the LED to the sending color to indicate activity.
+	s.ledDriver.WriteColors([]color.RGBA{sending})
+
+	// Read the temperature.
 	temp := float32(machine.ReadTemperature()) / 1000
+
 	// Send the temperature data over serial.
 	// Note: println in tinygo will send to serial by default.
 	println(temp)
+
+	// Wait a bit to allow the color to be seen.
+	time.Sleep(sendingLedTime * time.Millisecond)
+
+	// Set the LED to green to indicate the sensor is running.
+	s.ledDriver.WriteColors([]color.RGBA{on})
 }
 
 // receiveSerial continuously reads incoming data from the serial port.
-func (s *Sensor) receiveSerial() {
+func (s *SensorSettings) ReceiveSerial() {
 
 	for {
 		// Read from the serial interface.
@@ -76,7 +129,7 @@ func (s *Sensor) receiveSerial() {
 			}
 
 			// Allowed commands
-			// interval X: Set the read (and send) interval to X seconds.
+			// interval X: Set the read (and send) interval to X milliseconds, minimum 10 ms.
 			// stop: Stop sending temperature data.
 			// start: Start sending temperature data.
 			// Note: for simplicity, for bad commands or malformed ones, we just ignore them.
@@ -86,24 +139,17 @@ func (s *Sensor) receiveSerial() {
 				case "interval":
 					if len(command) > 1 {
 						// Parse the interval value.
-						s.lock.Lock()
 						interval, err := strconv.Atoi(command[1])
 						if err == nil {
-							// Set the interval to the new value.
-							s.interval = interval
+							s.SetInterval(interval)
 						}
-						s.lock.Unlock()
 					}
 				case "stop":
 					// Stop sending temperature data.
-					s.lock.Lock()
-					s.stop = true
-					s.lock.Unlock()
+					s.Stop()
 				case "start":
 					// Start sending temperature data.
-					s.lock.Lock()
-					s.stop = false
-					s.lock.Unlock()
+					s.Start()
 				}
 			}
 		}
@@ -111,4 +157,35 @@ func (s *Sensor) receiveSerial() {
 		// Yield to other goroutines. (Needed in TinyGo to allow other goroutines to run.)
 		runtime.Gosched()
 	}
+}
+
+// "Stop" the Sensor
+func (s *SensorSettings) Stop() {
+	s.lock.Lock()
+	s.stop = true
+	s.lock.Unlock()
+
+	// Set the LED to red to indicate the sensor is stopped.
+	s.ledDriver.WriteColors([]color.RGBA{off})
+}
+
+// "Start" the Sensor
+func (s *SensorSettings) Start() {
+	s.lock.Lock()
+	s.stop = false
+	s.lock.Unlock()
+
+	// Set the LED to green to indicate the sensor is running.
+	s.ledDriver.WriteColors([]color.RGBA{on})
+}
+
+// Set the interval for reading the sensor
+func (s *SensorSettings) SetInterval(interval int) {
+	s.lock.Lock()
+	if interval < minInterval {
+		s.interval = minInterval
+	} else {
+		s.interval = interval
+	}
+	s.lock.Unlock()
 }
